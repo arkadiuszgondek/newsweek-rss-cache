@@ -1,4 +1,39 @@
 # file: .github/workflows/newsweek-cache.yml
 name: Build Newsweek cache
-...
+
+on:
+  schedule:
+    - cron: "0 */5 * * *"  # co 5 godzin (UTC)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Ensure folders
+        run: |
+          mkdir -p tools data docs
+
+      - name: Build feed
+        run: |
+          python -V
+          python tools/newsweek_cache.py
+
+      - name: Commit & push artifact
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/newsweek.xml data/newsweek_store.json || true
+          git commit -m "update: newsweek cache" || echo "nothing to commit"
           git push
