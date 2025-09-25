@@ -1,0 +1,4 @@
+# file: .github/workflows/newsweek-cache.yml
+name: Build Newsweek cache
+...
+          git push
