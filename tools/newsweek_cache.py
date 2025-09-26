@@ -113,6 +113,16 @@ def parse_pubdate(pd: str):
     except Exception:
         return None
 
+# --- DROBNA HIGIENA OPISU ----------------------------------------------------
+def clean_description(desc: str) -> str:
+    """Usuwa pojedynczy końcowy nawias kwadratowy ']' (i spacje przed nim), jeśli występuje na końcu."""
+    if not desc:
+        return desc
+    # najpierw trywialne przycięcie
+    desc = desc.strip()
+    # usuń JEDEN końcowy ']' wraz z poprzedzającymi spacjami
+    return re.sub(r"\s*\]\s*$", "", desc)
+
 def extract_item_data(it):
     title = text(it, "title")
     link = text(it, "link")
@@ -120,6 +130,7 @@ def extract_item_data(it):
     # description
     desc_el = it.find("description")
     description = desc_el.text if (desc_el is not None and desc_el.text) else ""
+    description = clean_description(description)
 
     # enclosure z feedu
     enc_el = it.find("enclosure")
