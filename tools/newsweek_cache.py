@@ -1,19 +1,63 @@
 # file: tools/newsweek_cache.py
-import json, os, time, email.utils
+import json, os, email.utils, re
 from datetime import datetime, timedelta, timezone
 from urllib.request import urlopen, Request
 from xml.etree import ElementTree as ET
+from html.parser import HTMLParser
 
 FEED_URL = "https://www.newsweek.pl/.feed"
 STORE_PATH = "data/newsweek_store.json"
-OUTPUT_PATH = "docs/newsweek.xml"  # <-- zapis do /docs
+OUTPUT_PATH = "docs/newsweek.xml"  # zapis do /docs (GitHub Pages)
 RETENTION_DAYS = 7
 
 os.makedirs(os.path.dirname(STORE_PATH), exist_ok=True)
 os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
 
+# --- HTML utils: og:image -----------------------------------------------------
+class MetaGrabber(HTMLParser):
+    """Minimalny parser do pobrania og:image (+ opcjonalnie width/height)."""
+    def __init__(self):
+        super().__init__()
+        self.meta = {}
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "meta":
+            return
+        d = dict(attrs)
+        prop = (d.get("property") or d.get("name") or "").strip().lower()
+        if prop in ("og:image", "og:image:width", "og:image:height"):
+            self.meta[prop] = d.get("content")
+
+def fetch_og_image(url: str):
+    """Pobiera adres dużego obrazka z meta og:image strony artykułu."""
+    if not url:
+        return None
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0 (RSS cache)"})
+        with urlopen(req, timeout=20) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        p = MetaGrabber()
+        p.feed(html)
+        og = (p.meta.get("og:image") or "").strip()
+        if not og:
+            return None
+        # MIME po rozszerzeniu w URL (prosta heurystyka)
+        guessed_type = "image/jpeg"
+        lower = og.lower().split("?", 1)[0]
+        if lower.endswith(".webp"):
+            guessed_type = "image/webp"
+        elif lower.endswith(".png"):
+            guessed_type = "image/png"
+        return {"url": og, "length": "", "type": guessed_type}
+    except Exception:
+        return None
+
+# --- Czas i magazyn -----------------------------------------------------------
 def now_utc():
     return datetime.now(timezone.utc)
+
+def nowiso():
+    return now_utc().isoformat()
 
 def load_store():
     if not os.path.exists(STORE_PATH):
@@ -28,6 +72,7 @@ def save_store(store):
     with open(STORE_PATH, "w", encoding="utf-8") as f:
         json.dump(store, f, ensure_ascii=False)
 
+# --- Pobranie i parsowanie RSS -----------------------------------------------
 def fetch_feed_xml(url: str) -> bytes:
     req = Request(url, headers={"User-Agent": "Mozilla/5.0 (RSS cache)"})
     with urlopen(req, timeout=30) as resp:
@@ -38,12 +83,11 @@ def parse_rss_items(xml_bytes: bytes):
     items = []
     channel = root.find("channel")
     if channel is not None:
-        for it in channel.findall("item"):
-            items.append(it)
+        items.extend(channel.findall("item"))
     else:
+        # fallback dla ATOM (nie spodziewane, ale bezpieczne)
         ns = {"atom": "http://www.w3.org/2005/Atom"}
-        for it in root.findall("atom:entry", ns):
-            items.append(it)
+        items.extend(root.findall("atom:entry", ns))
     return items
 
 def text(el, tag):
@@ -72,8 +116,12 @@ def parse_pubdate(pd: str):
 def extract_item_data(it):
     title = text(it, "title")
     link = text(it, "link")
+
+    # description
     desc_el = it.find("description")
     description = desc_el.text if (desc_el is not None and desc_el.text) else ""
+
+    # enclosure z feedu
     enc_el = it.find("enclosure")
     enclosure = None
     if enc_el is not None:
@@ -82,10 +130,19 @@ def extract_item_data(it):
             "length": enc_el.attrib.get("length", ""),
             "type": enc_el.attrib.get("type", ""),
         }
+
+    # PRÓBA: większy obrazek z og:image
+    if link:
+        og_enc = fetch_og_image(link)
+        if og_enc and og_enc.get("url"):
+            enclosure = og_enc  # preferujemy og:image
+
     raw_guid = text(it, "guid")
     guid = guid_clean(raw_guid)
+
     pub_date_raw = text(it, "pubDate")
     pub_date = parse_pubdate(pub_date_raw)
+
     return {
         "guid": guid,
         "title": title,
@@ -96,9 +153,7 @@ def extract_item_data(it):
         "pubDate": pub_date.isoformat() if pub_date else None,
     }
 
-def nowiso():
-    return now_utc().isoformat()
-
+# --- Retencja i upsert --------------------------------------------------------
 def prune_store(store):
     cutoff = now_utc() - timedelta(days=RETENTION_DAYS)
     to_delete = []
@@ -120,6 +175,7 @@ def upsert_items(store, items_data):
         else:
             store[g].update({k: d[k] for k in d if k not in ("guid", "fetched_at")})
 
+# --- Budowa RSS 2.0 -----------------------------------------------------------
 def build_rss(store):
     rss = ET.Element("rss", attrib={"version": "2.0"})
     channel = ET.SubElement(rss, "channel")
@@ -143,22 +199,28 @@ def build_rss(store):
             ET.SubElement(it, "title").text = rec["title"]
         if rec.get("link"):
             ET.SubElement(it, "link").text = rec["link"]
+
         desc_text = rec.get("description") or ""
         if desc_text:
             d = ET.SubElement(it, "description")
+            # ElementTree nie ma natywnego CDATA – wstawiamy placeholder i zamienimy później
             d.text = f"__CDATA_PLACEHOLDER_START__{desc_text}__CDATA_PLACEHOLDER_END__"
+
         enc = rec.get("enclosure")
         if enc and enc.get("url"):
             enc_el = ET.SubElement(it, "enclosure")
             for k in ("url", "length", "type"):
                 v = enc.get(k)
-                if v:
+                if v is not None:
                     enc_el.set(k, str(v))
+
         if rec.get("pubDate_raw"):
             ET.SubElement(it, "pubDate").text = rec["pubDate_raw"]
+
         if rec.get("guid"):
             ET.SubElement(it, "guid").text = rec["guid"]
 
+    # Serializacja z deklaracją XML + CDATA
     tree = ET.ElementTree(rss)
     xml_bytes = ET.tostring(tree.getroot(), encoding="utf-8")
     xml_str = xml_bytes.decode("utf-8")
@@ -168,6 +230,7 @@ def build_rss(store):
         f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
         f.write(xml_str)
 
+# --- main ---------------------------------------------------------------------
 def main():
     store = load_store()
     prune_store(store)
